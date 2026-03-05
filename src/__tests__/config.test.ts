@@ -52,9 +52,11 @@ describe('configToSettings', () => {
       enabledChannels: ['telegram'],
       tgBotToken: 'bot123:abc',
       tgAllowedUsers: ['user1', 'user2'],
+      tgChatId: '99999',
     });
-    assert.equal(m.get('bridge_telegram_bot_token'), 'bot123:abc');
-    assert.equal(m.get('bridge_telegram_allowed_users'), 'user1,user2');
+    assert.equal(m.get('telegram_bot_token'), 'bot123:abc');
+    assert.equal(m.get('telegram_bridge_allowed_users'), 'user1,user2');
+    assert.equal(m.get('telegram_chat_id'), '99999');
   });
 
   it('maps discord config', () => {
@@ -89,13 +91,14 @@ describe('configToSettings', () => {
 
   it('maps workdir and model', () => {
     const m = configToSettings(base);
-    assert.equal(m.get('bridge_default_cwd'), '/tmp/test');
-    assert.equal(m.get('bridge_model'), 'claude-sonnet-4-20250514');
+    assert.equal(m.get('bridge_default_work_dir'), '/tmp/test');
+    assert.equal(m.get('bridge_default_model'), 'claude-sonnet-4-20250514');
+    assert.equal(m.get('default_model'), 'claude-sonnet-4-20250514');
   });
 
   it('omits optional fields when not set', () => {
     const m = configToSettings(base);
-    assert.equal(m.has('bridge_telegram_bot_token'), false);
+    assert.equal(m.has('telegram_bot_token'), false);
     assert.equal(m.has('bridge_discord_bot_token'), false);
     assert.equal(m.has('bridge_feishu_app_id'), false);
   });

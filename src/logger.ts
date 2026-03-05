@@ -63,11 +63,7 @@ export function setupLogger(): void {
   fs.mkdirSync(LOG_DIR, { recursive: true });
   logStream = openLogStream();
 
-  const origLog = console.log;
-  const origError = console.error;
-  const origWarn = console.warn;
-
-  const write = (level: string, args: unknown[], origFn: (...a: unknown[]) => void, isStderr: boolean) => {
+  const write = (level: string, args: unknown[]) => {
     const timestamp = new Date().toISOString();
     const message = args.map((a) => (typeof a === 'string' ? a : JSON.stringify(a))).join(' ');
     const formatted = `[${timestamp}] [${level}] ${message}`;
@@ -75,16 +71,9 @@ export function setupLogger(): void {
 
     rotateIfNeeded();
     logStream?.write(masked + '\n');
-
-    // Also write to original stdout/stderr
-    if (isStderr) {
-      process.stderr.write(masked + '\n');
-    } else {
-      process.stdout.write(masked + '\n');
-    }
   };
 
-  console.log = (...args: unknown[]) => write('INFO', args, origLog, false);
-  console.error = (...args: unknown[]) => write('ERROR', args, origError, true);
-  console.warn = (...args: unknown[]) => write('WARN', args, origWarn, true);
+  console.log = (...args: unknown[]) => write('INFO', args);
+  console.error = (...args: unknown[]) => write('ERROR', args);
+  console.warn = (...args: unknown[]) => write('WARN', args);
 }

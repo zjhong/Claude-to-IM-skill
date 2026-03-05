@@ -15,7 +15,7 @@ import 'claude-to-im/src/lib/bridge/adapters/index.js';
 
 import { loadConfig, configToSettings, CTI_HOME } from './config.js';
 import { JsonFileStore } from './store.js';
-import { SDKLLMProvider } from './llm-provider.js';
+import { SDKLLMProvider, resolveClaudeCliPath } from './llm-provider.js';
 import { PendingPermissions } from './permission-gateway.js';
 import { setupLogger } from './logger.js';
 
@@ -44,10 +44,22 @@ async function main(): Promise<void> {
   const runId = crypto.randomUUID();
   console.log(`[claude-to-im] Starting bridge (run_id: ${runId})`);
 
+  // Fail-fast: ensure Claude CLI is reachable before starting the bridge
+  const cliPath = resolveClaudeCliPath();
+  if (!cliPath) {
+    console.error(
+      '[claude-to-im] FATAL: Cannot find the `claude` CLI executable.\n' +
+      '  Tried: CTI_CLAUDE_CODE_EXECUTABLE env, /usr/local/bin/claude, /opt/homebrew/bin/claude, ~/.npm-global/bin/claude, ~/.local/bin/claude\n' +
+      '  Fix: Install Claude Code CLI (https://docs.anthropic.com/en/docs/claude-code) or set CTI_CLAUDE_CODE_EXECUTABLE=/path/to/claude',
+    );
+    process.exit(1);
+  }
+  console.log(`[claude-to-im] Using Claude CLI: ${cliPath}`);
+
   const settings = configToSettings(config);
   const store = new JsonFileStore(settings);
   const pendingPerms = new PendingPermissions();
-  const llm = new SDKLLMProvider(pendingPerms);
+  const llm = new SDKLLMProvider(pendingPerms, cliPath);
 
   const gateway = {
     resolvePendingPermission: (id: string, resolution: { behavior: 'allow' | 'deny'; message?: string }) =>

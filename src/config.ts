@@ -142,14 +142,22 @@ export function configToSettings(config: Config): Map<string, string> {
   const m = new Map<string, string>();
   m.set("remote_bridge_enabled", "true");
 
+  // ── Telegram ──
+  // Upstream keys: telegram_bot_token, bridge_telegram_enabled,
+  //   telegram_bridge_allowed_users, telegram_chat_id
   m.set(
     "bridge_telegram_enabled",
     config.enabledChannels.includes("telegram") ? "true" : "false"
   );
-  if (config.tgBotToken) m.set("bridge_telegram_bot_token", config.tgBotToken);
+  if (config.tgBotToken) m.set("telegram_bot_token", config.tgBotToken);
   if (config.tgAllowedUsers)
-    m.set("bridge_telegram_allowed_users", config.tgAllowedUsers.join(","));
+    m.set("telegram_bridge_allowed_users", config.tgAllowedUsers.join(","));
+  if (config.tgChatId) m.set("telegram_chat_id", config.tgChatId);
 
+  // ── Discord ──
+  // Upstream keys: bridge_discord_bot_token, bridge_discord_enabled,
+  //   bridge_discord_allowed_users, bridge_discord_allowed_channels,
+  //   bridge_discord_allowed_guilds
   m.set(
     "bridge_discord_enabled",
     config.enabledChannels.includes("discord") ? "true" : "false"
@@ -169,6 +177,9 @@ export function configToSettings(config: Config): Map<string, string> {
       config.discordAllowedGuilds.join(",")
     );
 
+  // ── Feishu ──
+  // Upstream keys: bridge_feishu_app_id, bridge_feishu_app_secret,
+  //   bridge_feishu_domain, bridge_feishu_enabled, bridge_feishu_allowed_users
   m.set(
     "bridge_feishu_enabled",
     config.enabledChannels.includes("feishu") ? "true" : "false"
@@ -180,8 +191,11 @@ export function configToSettings(config: Config): Map<string, string> {
   if (config.feishuAllowedUsers)
     m.set("bridge_feishu_allowed_users", config.feishuAllowedUsers.join(","));
 
-  m.set("bridge_default_cwd", config.defaultWorkDir);
-  m.set("bridge_model", config.defaultModel);
+  // ── Defaults ──
+  // Upstream keys: bridge_default_work_dir, bridge_default_model, default_model
+  m.set("bridge_default_work_dir", config.defaultWorkDir);
+  m.set("bridge_default_model", config.defaultModel);
+  m.set("default_model", config.defaultModel);
 
   return m;
 }

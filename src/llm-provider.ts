@@ -5,6 +5,7 @@
  * the claude-to-im bridge conversation engine.
  */
 
+import fs from 'node:fs';
 import { query } from '@anthropic-ai/claude-agent-sdk';
 import type { SDKMessage, PermissionResult } from '@anthropic-ai/claude-agent-sdk';
 import type { LLMProvider, StreamChatParams } from 'claude-to-im/src/lib/bridge/host.js';
@@ -15,26 +16,52 @@ function sseEvent(type: string, data: unknown): string {
   return `data: ${JSON.stringify({ type, data: payload })}\n`;
 }
 
+/**
+ * Resolve the path to the `claude` CLI executable.
+ * Priority: CTI_CLAUDE_CODE_EXECUTABLE env → `which claude` → common install paths.
+ */
+export function resolveClaudeCliPath(): string | undefined {
+  // 1. Explicit env var
+  const fromEnv = process.env.CTI_CLAUDE_CODE_EXECUTABLE;
+  if (fromEnv && fs.existsSync(fromEnv)) return fromEnv;
+
+  // 2. Common install locations
+  const candidates = [
+    '/usr/local/bin/claude',
+    '/opt/homebrew/bin/claude',
+    `${process.env.HOME}/.npm-global/bin/claude`,
+    `${process.env.HOME}/.local/bin/claude`,
+  ];
+  for (const p of candidates) {
+    if (fs.existsSync(p)) return p;
+  }
+
+  return undefined;
+}
+
 export class SDKLLMProvider implements LLMProvider {
-  constructor(private pendingPerms: PendingPermissions) {}
+  private cliPath: string | undefined;
+
+  constructor(private pendingPerms: PendingPermissions, cliPath?: string) {
+    this.cliPath = cliPath;
+  }
 
   streamChat(params: StreamChatParams): ReadableStream<string> {
     const pendingPerms = this.pendingPerms;
+    const cliPath = this.cliPath;
 
     return new ReadableStream({
       start(controller) {
         (async () => {
           try {
-            const q = query({
-              prompt: params.prompt,
-              options: {
-                cwd: params.workingDirectory,
-                model: params.model,
-                resume: params.sdkSessionId || undefined,
-                abortController: params.abortController,
-                permissionMode: (params.permissionMode as 'default' | 'acceptEdits' | 'plan') || undefined,
-                includePartialMessages: true,
-                canUseTool: async (
+            const queryOptions: Record<string, unknown> = {
+              cwd: params.workingDirectory,
+              model: params.model,
+              resume: params.sdkSessionId || undefined,
+              abortController: params.abortController,
+              permissionMode: (params.permissionMode as 'default' | 'acceptEdits' | 'plan') || undefined,
+              includePartialMessages: true,
+              canUseTool: async (
                   toolName: string,
                   input: Record<string, unknown>,
                   opts,
@@ -60,7 +87,14 @@ export class SDKLLMProvider implements LLMProvider {
                     message: result.message || 'Denied by user',
                   };
                 },
-              },
+            };
+            if (cliPath) {
+              queryOptions.pathToClaudeCodeExecutable = cliPath;
+            }
+
+            const q = query({
+              prompt: params.prompt,
+              options: queryOptions as Parameters<typeof query>[0]['options'],
             });
 
             for await (const msg of q) {
@@ -70,6 +104,9 @@ export class SDKLLMProvider implements LLMProvider {
             controller.close();
           } catch (err) {
             const message = err instanceof Error ? err.message : String(err);
+            // Log full error (including stack) to bridge log for debugging
+            console.error('[llm-provider] SDK query error:', err instanceof Error ? err.stack || err.message : err);
+            // Send simplified but actionable summary to IM
             controller.enqueue(sseEvent('error', message));
             controller.close();
           }

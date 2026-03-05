@@ -270,7 +270,7 @@ export class JsonFileStore implements BridgeStore {
   ): BridgeSession {
     const session: BridgeSession = {
       id: uuid(),
-      working_directory: cwd || this.settings.get('bridge_default_cwd') || process.cwd(),
+      working_directory: cwd || this.settings.get('bridge_default_work_dir') || process.cwd(),
       model,
       system_prompt: systemPrompt,
     };
