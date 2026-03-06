@@ -6,7 +6,7 @@ export interface Config {
   runtime: 'claude' | 'codex' | 'auto';
   enabledChannels: string[];
   defaultWorkDir: string;
-  defaultModel: string;
+  defaultModel?: string;
   defaultMode: string;
   // Telegram
   tgBotToken?: string;
@@ -72,8 +72,7 @@ export function loadConfig(): Config {
     runtime,
     enabledChannels: splitCsv(env.get("CTI_ENABLED_CHANNELS")) ?? [],
     defaultWorkDir: env.get("CTI_DEFAULT_WORKDIR") || process.cwd(),
-    defaultModel:
-      env.get("CTI_DEFAULT_MODEL") || (runtime === 'codex' ? 'o4-mini' : 'claude-sonnet-4-20250514'),
+    defaultModel: env.get("CTI_DEFAULT_MODEL") || undefined,
     defaultMode: env.get("CTI_DEFAULT_MODE") || "code",
     tgBotToken: env.get("CTI_TG_BOT_TOKEN") || undefined,
     tgChatId: env.get("CTI_TG_CHAT_ID") || undefined,
@@ -104,7 +103,7 @@ export function saveConfig(config: Config): void {
     config.enabledChannels.join(",")
   );
   out += formatEnvLine("CTI_DEFAULT_WORKDIR", config.defaultWorkDir);
-  out += formatEnvLine("CTI_DEFAULT_MODEL", config.defaultModel);
+  if (config.defaultModel) out += formatEnvLine("CTI_DEFAULT_MODEL", config.defaultModel);
   out += formatEnvLine("CTI_DEFAULT_MODE", config.defaultMode);
   out += formatEnvLine("CTI_TG_BOT_TOKEN", config.tgBotToken);
   out += formatEnvLine("CTI_TG_CHAT_ID", config.tgChatId);
@@ -200,8 +199,10 @@ export function configToSettings(config: Config): Map<string, string> {
   // ── Defaults ──
   // Upstream keys: bridge_default_work_dir, bridge_default_model, default_model
   m.set("bridge_default_work_dir", config.defaultWorkDir);
-  m.set("bridge_default_model", config.defaultModel);
-  m.set("default_model", config.defaultModel);
+  if (config.defaultModel) {
+    m.set("bridge_default_model", config.defaultModel);
+    m.set("default_model", config.defaultModel);
+  }
   m.set("bridge_default_mode", config.defaultMode);
 
   return m;

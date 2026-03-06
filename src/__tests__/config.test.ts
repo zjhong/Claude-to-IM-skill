@@ -31,7 +31,6 @@ describe('configToSettings', () => {
     runtime: 'claude',
     enabledChannels: [],
     defaultWorkDir: '/tmp/test',
-    defaultModel: 'claude-sonnet-4-20250514',
     defaultMode: 'code',
   };
 
@@ -90,12 +89,18 @@ describe('configToSettings', () => {
     assert.equal(m.get('bridge_feishu_allowed_users'), 'fu1');
   });
 
-  it('maps workdir, model, and mode', () => {
+  it('maps workdir and mode, omits model when not set', () => {
     const m = configToSettings(base);
     assert.equal(m.get('bridge_default_work_dir'), '/tmp/test');
-    assert.equal(m.get('bridge_default_model'), 'claude-sonnet-4-20250514');
-    assert.equal(m.get('default_model'), 'claude-sonnet-4-20250514');
+    assert.equal(m.has('bridge_default_model'), false);
+    assert.equal(m.has('default_model'), false);
     assert.equal(m.get('bridge_default_mode'), 'code');
+  });
+
+  it('maps model when explicitly set', () => {
+    const m = configToSettings({ ...base, defaultModel: 'gpt-4o' });
+    assert.equal(m.get('bridge_default_model'), 'gpt-4o');
+    assert.equal(m.get('default_model'), 'gpt-4o');
   });
 
   it('maps non-default mode', () => {
@@ -134,7 +139,6 @@ describe('loadConfig/saveConfig round-trip', () => {
       runtime: 'claude',
       enabledChannels: [],
       defaultWorkDir: process.cwd(),
-      defaultModel: 'claude-sonnet-4-20250514',
       defaultMode: 'code',
     });
     assert.equal(m.get('bridge_telegram_enabled'), 'false');

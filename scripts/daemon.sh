@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
-CTI_HOME="$HOME/.claude-to-im"
+CTI_HOME="${CTI_HOME:-$HOME/.claude-to-im}"
 SKILL_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 PID_FILE="$CTI_HOME/runtime/bridge.pid"
 STATUS_FILE="$CTI_HOME/runtime/status.json"
 LOG_FILE="$CTI_HOME/logs/bridge.log"
+
+# ── Common helpers ──
 
 ensure_dirs() { mkdir -p "$CTI_HOME"/{data,logs,runtime,data/messages}; }
 
@@ -13,7 +15,6 @@ ensure_built() {
   if [ ! -f "$SKILL_DIR/dist/daemon.mjs" ]; then
     need_build=1
   else
-    # Rebuild if any src file is newer than the bundle
     local newest_src
     newest_src=$(find "$SKILL_DIR/src" -name '*.ts' -newer "$SKILL_DIR/dist/daemon.mjs" 2>/dev/null | head -1)
     if [ -n "$newest_src" ]; then
@@ -27,19 +28,15 @@ ensure_built() {
 }
 
 # Clean environment for subprocess isolation.
-# CTI_ENV_ISOLATION=strict (default): strip CLAUDECODE + ANTHROPIC_* from parent env.
-# CTI_ENV_ISOLATION=inherit: only strip CLAUDECODE.
 clean_env() {
   unset CLAUDECODE 2>/dev/null || true
 
-  # Read runtime from config
   local runtime
   runtime=$(grep "^CTI_RUNTIME=" "$CTI_HOME/config.env" 2>/dev/null | head -1 | cut -d= -f2- | tr -d "'" | tr -d '"' || true)
   runtime="${runtime:-claude}"
 
   local mode="${CTI_ENV_ISOLATION:-strict}"
   if [ "$mode" = "strict" ]; then
-    # Strip ANTHROPIC_* in codex mode, OPENAI_* in claude mode
     case "$runtime" in
       codex)
         while IFS='=' read -r name _; do
@@ -57,7 +54,6 @@ clean_env() {
         done < <(env)
         ;;
       auto)
-        # In auto mode, keep both sets of env vars
         if [ "${CTI_ANTHROPIC_PASSTHROUGH:-}" != "true" ]; then
           while IFS='=' read -r name _; do
             case "$name" in ANTHROPIC_*) unset "$name" 2>/dev/null || true ;; esac
@@ -68,94 +64,133 @@ clean_env() {
   fi
 }
 
+read_pid() {
+  [ -f "$PID_FILE" ] && cat "$PID_FILE" 2>/dev/null || echo ""
+}
+
+pid_alive() {
+  local pid="$1"
+  [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null
+}
+
+status_running() {
+  [ -f "$STATUS_FILE" ] && grep -q '"running"[[:space:]]*:[[:space:]]*true' "$STATUS_FILE" 2>/dev/null
+}
+
+show_last_exit_reason() {
+  if [ -f "$STATUS_FILE" ]; then
+    local reason
+    reason=$(grep -o '"lastExitReason"[[:space:]]*:[[:space:]]*"[^"]*"' "$STATUS_FILE" 2>/dev/null | head -1 | sed 's/.*: *"//;s/"$//')
+    [ -n "$reason" ] && echo "Last exit reason: $reason"
+  fi
+}
+
+show_failure_help() {
+  echo ""
+  echo "Recent logs:"
+  tail -20 "$LOG_FILE" 2>/dev/null || echo "  (no log file)"
+  echo ""
+  echo "Next steps:"
+  echo "  1. Run diagnostics:  bash \"$SKILL_DIR/scripts/doctor.sh\""
+  echo "  2. Check full logs:  bash \"$SKILL_DIR/scripts/daemon.sh\" logs 100"
+  echo "  3. Rebuild bundle:   cd \"$SKILL_DIR\" && npm run build"
+}
+
+# ── Load platform-specific supervisor ──
+
+if [ "$(uname -s)" = "Darwin" ]; then
+  # shellcheck source=supervisor-macos.sh
+  source "$SKILL_DIR/scripts/supervisor-macos.sh"
+else
+  # shellcheck source=supervisor-linux.sh
+  source "$SKILL_DIR/scripts/supervisor-linux.sh"
+fi
+
+# ── Commands ──
+
 case "${1:-help}" in
   start)
     ensure_dirs
     ensure_built
-    if [ -f "$PID_FILE" ] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
-      echo "Bridge already running (PID: $(cat "$PID_FILE"))"
+
+    # Check if already running
+    EXISTING_PID=$(read_pid)
+    if pid_alive "$EXISTING_PID"; then
+      echo "Bridge already running (PID: $EXISTING_PID)"
       cat "$STATUS_FILE" 2>/dev/null
       exit 1
     fi
+
     clean_env
-    # Start daemon in a new session when possible so Ctrl-C / SIGINT from the
-    # caller shell doesn't accidentally terminate the background bridge process.
-    if command -v setsid >/dev/null 2>&1; then
-      setsid node "$SKILL_DIR/dist/daemon.mjs" >> "$LOG_FILE" 2>&1 < /dev/null &
-    else
-      nohup node "$SKILL_DIR/dist/daemon.mjs" >> "$LOG_FILE" 2>&1 < /dev/null &
-    fi
-    echo $! > "$PID_FILE"
+    echo "Starting bridge..."
+    supervisor_start
     sleep 2
-    # Verify: PID alive AND status.json says running=true
-    PID_OK=false
-    STATUS_OK=false
-    kill -0 "$(cat "$PID_FILE")" 2>/dev/null && PID_OK=true
-    if [ -f "$STATUS_FILE" ] && grep -q '"running"[[:space:]]*:[[:space:]]*true' "$STATUS_FILE" 2>/dev/null; then
-      STATUS_OK=true
-    fi
-    if [ "$PID_OK" = "true" ] && [ "$STATUS_OK" = "true" ]; then
-      echo "Bridge started (PID: $(cat "$PID_FILE"))"
+
+    # Verify: read PID written by main.ts, check process + status.json
+    NEW_PID=$(read_pid)
+    if pid_alive "$NEW_PID" && status_running; then
+      echo "Bridge started (PID: $NEW_PID)"
       cat "$STATUS_FILE" 2>/dev/null
     else
       echo "Failed to start bridge."
-      if [ "$PID_OK" = "false" ]; then
-        echo "  Process exited immediately."
-      elif [ "$STATUS_OK" = "false" ]; then
-        echo "  Process running but status.json not reporting running=true."
-      fi
-      # Show lastExitReason if available
-      if [ -f "$STATUS_FILE" ]; then
-        LAST_REASON=$(grep -o '"lastExitReason"[[:space:]]*:[[:space:]]*"[^"]*"' "$STATUS_FILE" 2>/dev/null | head -1 | sed 's/.*: *"//;s/"$//')
-        if [ -n "$LAST_REASON" ]; then
-          echo "  Last exit reason: $LAST_REASON"
-        fi
-      fi
-      echo ""
-      echo "Recent logs:"
-      tail -20 "$LOG_FILE"
-      echo ""
-      echo "Next steps:"
-      echo "  1. Run diagnostics:  bash \"$SKILL_DIR/scripts/doctor.sh\""
-      echo "  2. Check full logs:  bash \"$SKILL_DIR/scripts/daemon.sh\" logs 100"
-      echo "  3. Rebuild bundle:   cd \"$SKILL_DIR\" && npm run build"
+      pid_alive "$NEW_PID" || echo "  Process not running."
+      status_running || echo "  status.json not reporting running=true."
+      show_last_exit_reason
+      show_failure_help
       exit 1
     fi
     ;;
+
   stop)
-    if [ ! -f "$PID_FILE" ]; then echo "No bridge running"; exit 0; fi
-    PID=$(cat "$PID_FILE")
-    if kill -0 "$PID" 2>/dev/null; then
-      kill "$PID"
-      for i in $(seq 1 10); do
-        kill -0 "$PID" 2>/dev/null || break
-        sleep 1
-      done
-      kill -0 "$PID" 2>/dev/null && kill -9 "$PID"
+    if supervisor_is_managed; then
+      echo "Stopping bridge..."
+      supervisor_stop
       echo "Bridge stopped"
     else
-      echo "Bridge was not running (stale PID file)"
+      PID=$(read_pid)
+      if [ -z "$PID" ]; then echo "No bridge running"; exit 0; fi
+      if pid_alive "$PID"; then
+        kill "$PID"
+        for _ in $(seq 1 10); do
+          pid_alive "$PID" || break
+          sleep 1
+        done
+        pid_alive "$PID" && kill -9 "$PID"
+        echo "Bridge stopped"
+      else
+        echo "Bridge was not running (stale PID file)"
+      fi
+      rm -f "$PID_FILE"
     fi
-    rm -f "$PID_FILE"
     ;;
+
   status)
-    if [ -f "$PID_FILE" ] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
-      echo "Bridge is running (PID: $(cat "$PID_FILE"))"
+    PID=$(read_pid)
+
+    # Platform-specific status info
+    supervisor_status_extra
+
+    if pid_alive "$PID"; then
+      echo "Bridge process is running (PID: $PID)"
+      # Business status
+      if status_running; then
+        echo "Bridge status: running"
+      else
+        echo "Bridge status: process alive but status.json not reporting running"
+      fi
       cat "$STATUS_FILE" 2>/dev/null
     else
       echo "Bridge is not running"
       [ -f "$PID_FILE" ] && rm -f "$PID_FILE"
-      # Show last exit reason if available
-      if [ -f "$STATUS_FILE" ]; then
-        LAST_REASON=$(grep -o '"lastExitReason"[[:space:]]*:[[:space:]]*"[^"]*"' "$STATUS_FILE" 2>/dev/null | head -1 | sed 's/.*: *"//;s/"$//')
-        [ -n "$LAST_REASON" ] && echo "Last exit reason: $LAST_REASON"
-      fi
+      show_last_exit_reason
     fi
     ;;
+
   logs)
     N="${2:-50}"
-    tail -n "$N" "$LOG_FILE" 2>/dev/null | sed -E 's/(token|secret|password)(["\x27]?\s*[:=]\s*["\x27]?)[^ "]+/\1\2*****/gi'
+    tail -n "$N" "$LOG_FILE" 2>/dev/null | sed -E 's/(token|secret|password)(["\\x27]?\s*[:=]\s*["\\x27]?)[^ "]+/\1\2*****/gi'
     ;;
+
   *)
     echo "Usage: daemon.sh {start|stop|status|logs [N]}"
     ;;

@@ -23,6 +23,7 @@ import { setupLogger } from './logger.js';
 
 const RUNTIME_DIR = path.join(CTI_HOME, 'runtime');
 const STATUS_FILE = path.join(RUNTIME_DIR, 'status.json');
+const PID_FILE = path.join(RUNTIME_DIR, 'bridge.pid');
 
 /**
  * Resolve the LLM provider based on the runtime setting.
@@ -108,6 +109,9 @@ async function main(): Promise<void> {
     permissions: gateway,
     lifecycle: {
       onBridgeStart: () => {
+        // Write authoritative PID from the actual process (not shell $!)
+        fs.mkdirSync(RUNTIME_DIR, { recursive: true });
+        fs.writeFileSync(PID_FILE, String(process.pid), 'utf-8');
         writeStatus({
           running: true,
           pid: process.pid,
