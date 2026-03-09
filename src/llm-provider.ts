@@ -57,12 +57,13 @@ export function isNonClaudeModel(model?: string): boolean {
 /**
  * Build a clean env for the CLI subprocess.
  *
- * CTI_ENV_ISOLATION (default "strict"):
+ * CTI_ENV_ISOLATION (default "inherit"):
+ *   "inherit" — full parent env minus CLAUDECODE (recommended; daemon
+ *               already runs in a clean launchd/setsid environment)
  *   "strict"  — only whitelist + CTI_* + ANTHROPIC_* from config.env
- *   "inherit" — full parent env minus CLAUDECODE
  */
 export function buildSubprocessEnv(): Record<string, string> {
-  const mode = process.env.CTI_ENV_ISOLATION || 'strict';
+  const mode = process.env.CTI_ENV_ISOLATION || 'inherit';
   const out: Record<string, string> = {};
 
   if (mode === 'inherit') {
