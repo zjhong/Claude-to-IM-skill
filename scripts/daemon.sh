@@ -44,21 +44,14 @@ clean_env() {
         done < <(env)
         ;;
       claude)
-        if [ "${CTI_ANTHROPIC_PASSTHROUGH:-}" != "true" ]; then
-          while IFS='=' read -r name _; do
-            case "$name" in ANTHROPIC_*) unset "$name" 2>/dev/null || true ;; esac
-          done < <(env)
-        fi
+        # Keep ANTHROPIC_* (from config.env) — needed for third-party API providers.
+        # Strip OPENAI_* to avoid cross-runtime leakage.
         while IFS='=' read -r name _; do
           case "$name" in OPENAI_*) unset "$name" 2>/dev/null || true ;; esac
         done < <(env)
         ;;
       auto)
-        if [ "${CTI_ANTHROPIC_PASSTHROUGH:-}" != "true" ]; then
-          while IFS='=' read -r name _; do
-            case "$name" in ANTHROPIC_*) unset "$name" 2>/dev/null || true ;; esac
-          done < <(env)
-        fi
+        # Keep both ANTHROPIC_* and OPENAI_* for auto mode
         ;;
     esac
   fi

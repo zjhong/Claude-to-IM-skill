@@ -30,21 +30,51 @@ const ENV_WHITELIST = new Set([
 /** Prefixes that are always stripped (even in inherit mode). */
 const ENV_ALWAYS_STRIP = ['CLAUDECODE'];
 
-// ── Auth-error detection ──
+// ── Auth/credential-error detection ──
 
-const AUTH_ERROR_PATTERNS = [
+/** Patterns indicating the local CLI is not logged in (fixable via `claude auth login`). */
+const CLI_AUTH_PATTERNS = [
   /not logged in/i,
   /please run \/login/i,
   /loggedIn['":\s]*false/i,
 ];
 
-/** Check if an error message or stderr indicates a CLI auth failure. */
-export function isAuthError(text: string): boolean {
-  return AUTH_ERROR_PATTERNS.some(re => re.test(text));
+/**
+ * Patterns indicating an API-level credential failure (wrong key, expired token, org restriction).
+ * Must be specific to API/auth context — avoid matching local file permissions, tool denials,
+ * or generic HTTP 403s that may have non-auth causes.
+ */
+const API_AUTH_PATTERNS = [
+  /unauthorized/i,
+  /invalid.*api.?key/i,
+  /authentication.*failed/i,
+  /does not have access/i,
+  /401\b/,
+];
+
+export type AuthErrorKind = 'cli' | 'api' | false;
+
+/**
+ * Classify an error message as a CLI login issue, an API credential issue, or neither.
+ * Returns 'cli' for local auth problems, 'api' for remote credential problems, false otherwise.
+ */
+export function classifyAuthError(text: string): AuthErrorKind {
+  if (CLI_AUTH_PATTERNS.some(re => re.test(text))) return 'cli';
+  if (API_AUTH_PATTERNS.some(re => re.test(text))) return 'api';
+  return false;
 }
 
-const AUTH_ERROR_USER_MESSAGE =
+/** Backwards-compatible: returns true for any auth/credential error. */
+export function isAuthError(text: string): boolean {
+  return classifyAuthError(text) !== false;
+}
+
+const CLI_AUTH_USER_MESSAGE =
   'Claude CLI is not logged in. Run `claude auth login`, then restart the bridge.';
+
+const API_AUTH_USER_MESSAGE =
+  'API credential error. Check your ANTHROPIC_API_KEY / ANTHROPIC_AUTH_TOKEN in config.env, ' +
+  'or verify your organization has access to the requested model.';
 
 // ── Cross-runtime model guard ──
 
@@ -54,6 +84,7 @@ const NON_CLAUDE_MODEL_RE = /^(gpt-|o[1-9][-_]|codex[-_]|davinci|text-|openai\/)
 export function isNonClaudeModel(model?: string): boolean {
   return !!model && NON_CLAUDE_MODEL_RE.test(model);
 }
+
 /**
  * Build a clean env for the CLI subprocess.
  *
@@ -81,16 +112,16 @@ export function buildSubprocessEnv(): Record<string, string> {
       // Pass through CTI_* so skill config is available
       if (k.startsWith('CTI_')) { out[k] = v; continue; }
     }
-    // ANTHROPIC_* should come from config.env, not parent process.
-    // Only pass them if CTI_ANTHROPIC_PASSTHROUGH is explicitly set.
-    if (process.env.CTI_ANTHROPIC_PASSTHROUGH === 'true') {
+    // Always pass through ANTHROPIC_* in claude/auto runtime —
+    // third-party API providers need these to reach the CLI subprocess.
+    const runtime = process.env.CTI_RUNTIME || 'claude';
+    if (runtime === 'claude' || runtime === 'auto') {
       for (const [k, v] of Object.entries(process.env)) {
         if (v !== undefined && k.startsWith('ANTHROPIC_')) out[k] = v;
       }
     }
 
     // In codex/auto mode, pass through OPENAI_* / CODEX_* env vars
-    const runtime = process.env.CTI_RUNTIME || 'claude';
     if (runtime === 'codex' || runtime === 'auto') {
       for (const [k, v] of Object.entries(process.env)) {
         if (v !== undefined && (k.startsWith('OPENAI_') || k.startsWith('CODEX_'))) out[k] = v;
@@ -103,27 +134,116 @@ export function buildSubprocessEnv(): Record<string, string> {
 
 // ── Claude CLI preflight check ──
 
+/** Minimum major version of Claude CLI required by the SDK. */
+const MIN_CLI_MAJOR = 2;
+
 /**
- * Run a lightweight preflight check to verify the claude CLI can start.
- * Spawns `claude --version` with a clean env and short timeout.
+ * Parse a version string like "2.3.1" or "claude 2.3.1" into a major number.
+ * Returns undefined if parsing fails.
+ */
+export function parseCliMajorVersion(versionOutput: string): number | undefined {
+  const m = versionOutput.match(/(\d+)\.\d+/);
+  return m ? parseInt(m[1], 10) : undefined;
+}
+
+/**
+ * Run `claude --version` at a given path and return the version string.
+ * Returns undefined on failure.
+ */
+function getCliVersion(cliPath: string, env?: Record<string, string>): string | undefined {
+  try {
+    return execSync(`"${cliPath}" --version`, {
+      encoding: 'utf-8',
+      timeout: 10_000,
+      env: env || buildSubprocessEnv(),
+      stdio: ['pipe', 'pipe', 'pipe'],
+    }).trim();
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Flags that the SDK passes to the CLI subprocess.
+ * If `claude --help` doesn't mention these, the CLI build is incompatible.
+ */
+const REQUIRED_CLI_FLAGS = ['output-format', 'input-format', 'permission-mode', 'setting-sources'];
+
+/**
+ * Check `claude --help` for required flags.
+ * Returns the list of missing flags (empty = all present).
+ */
+function checkRequiredFlags(cliPath: string, env?: Record<string, string>): string[] {
+  let helpText: string;
+  try {
+    helpText = execSync(`"${cliPath}" --help`, {
+      encoding: 'utf-8',
+      timeout: 10_000,
+      env: env || buildSubprocessEnv(),
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+  } catch {
+    // Can't run --help; don't block on this — version check is primary
+    return [];
+  }
+  return REQUIRED_CLI_FLAGS.filter(flag => !helpText.includes(flag));
+}
+
+/**
+ * Check if a CLI path points to a compatible (>= 2.x) Claude CLI
+ * with the required flags for SDK integration.
+ * Returns { compatible, version, ... } or undefined if the CLI cannot run at all.
+ */
+export function checkCliCompatibility(cliPath: string, env?: Record<string, string>): {
+  compatible: boolean;
+  version: string;
+  major: number | undefined;
+  missingFlags?: string[];
+} | undefined {
+  const version = getCliVersion(cliPath, env);
+  if (!version) return undefined;
+  const major = parseCliMajorVersion(version);
+  if (major === undefined || major < MIN_CLI_MAJOR) {
+    return { compatible: false, version, major };
+  }
+  // Version OK — verify required flags exist
+  const missing = checkRequiredFlags(cliPath, env);
+  return {
+    compatible: missing.length === 0,
+    version,
+    major,
+    missingFlags: missing.length > 0 ? missing : undefined,
+  };
+}
+
+/**
+ * Run a lightweight preflight check to verify the claude CLI can start
+ * and supports the flags required by the SDK.
  * Returns { ok, version?, error? }.
  */
 export function preflightCheck(cliPath: string): { ok: boolean; version?: string; error?: string } {
   const cleanEnv = buildSubprocessEnv();
-  try {
-    const output = execSync(`"${cliPath}" --version`, {
-      encoding: 'utf-8',
-      timeout: 10_000,
-      env: cleanEnv,
-      stdio: ['pipe', 'pipe', 'pipe'],
-    }).trim();
-    return { ok: true, version: output };
-  } catch (err) {
-    const e = err as { status?: number; stderr?: string; message?: string };
-    const stderr = typeof e.stderr === 'string' ? e.stderr.trim() : '';
-    const detail = stderr || e.message || 'unknown error';
-    return { ok: false, error: `claude CLI exited with code ${e.status ?? '?'}: ${detail}` };
+  const compat = checkCliCompatibility(cliPath, cleanEnv);
+  if (!compat) {
+    return { ok: false, error: `claude CLI at "${cliPath}" failed to execute` };
   }
+  if (compat.major !== undefined && compat.major < MIN_CLI_MAJOR) {
+    return {
+      ok: false,
+      version: compat.version,
+      error: `claude CLI version ${compat.version} is too old (need >= ${MIN_CLI_MAJOR}.x). ` +
+        `This is likely an npm-installed 1.x CLI. Install the native CLI: https://docs.anthropic.com/en/docs/claude-code`,
+    };
+  }
+  if (compat.missingFlags) {
+    return {
+      ok: false,
+      version: compat.version,
+      error: `claude CLI ${compat.version} is missing required flags: ${compat.missingFlags.join(', ')}. ` +
+        `Update the CLI: npm update -g @anthropic-ai/claude-code`,
+    };
+  }
+  return { ok: true, version: compat.version };
 }
 
 // ── Claude CLI path resolution ──
@@ -138,42 +258,90 @@ function isExecutable(p: string): boolean {
 }
 
 /**
+ * Resolve all `claude` executables found in PATH (Unix only).
+ * Returns an array of absolute paths.
+ */
+function findAllInPath(): string[] {
+  if (process.platform === 'win32') {
+    try {
+      return execSync('where claude', { encoding: 'utf-8', timeout: 3000 })
+        .trim().split('\n').map(s => s.trim()).filter(Boolean);
+    } catch { return []; }
+  }
+  try {
+    // `which -a` lists all matches, not just the first
+    return execSync('which -a claude', { encoding: 'utf-8', timeout: 3000 })
+      .trim().split('\n').map(s => s.trim()).filter(Boolean);
+  } catch { return []; }
+}
+
+/**
  * Resolve the path to the `claude` CLI executable.
- * Priority: CTI_CLAUDE_CODE_EXECUTABLE env → which/where command → common install paths.
+ *
+ * Priority:
+ *   1. CTI_CLAUDE_CODE_EXECUTABLE env var (explicit override)
+ *   2. All `claude` executables in PATH — pick first compatible (>= 2.x)
+ *   3. Common install locations — pick first compatible (>= 2.x)
+ *
+ * This multi-candidate approach handles the common scenario where
+ * nvm/npm puts an old 1.x claude in PATH before the native 2.x CLI.
  */
 export function resolveClaudeCliPath(): string | undefined {
-  // 1. Explicit env var
+  // 1. Explicit env var — trust the user
   const fromEnv = process.env.CTI_CLAUDE_CODE_EXECUTABLE;
   if (fromEnv && isExecutable(fromEnv)) return fromEnv;
 
-  // 2. Platform-specific command (which for Unix, where for Windows)
+  // 2. Gather all candidates
   const isWindows = process.platform === 'win32';
-  const cmd = isWindows ? 'where claude' : 'which claude';
-  try {
-    const resolved = execSync(cmd, { encoding: 'utf-8', timeout: 3000 }).trim().split('\n')[0];
-    if (resolved && isExecutable(resolved)) return resolved;
-  } catch {
-    // not found in PATH
-  }
-
-  // 3. Common install locations
-  const candidates = isWindows
+  const pathCandidates = findAllInPath();
+  const wellKnown = isWindows
     ? [
         process.env.LOCALAPPDATA ? `${process.env.LOCALAPPDATA}\\Programs\\claude\\claude.exe` : '',
         'C:\\Program Files\\claude\\claude.exe',
       ].filter(Boolean)
     : [
+        `${process.env.HOME}/.claude/local/claude`,
+        `${process.env.HOME}/.local/bin/claude`,
         '/usr/local/bin/claude',
         '/opt/homebrew/bin/claude',
         `${process.env.HOME}/.npm-global/bin/claude`,
-        `${process.env.HOME}/.local/bin/claude`,
-        `${process.env.HOME}/.claude/local/claude`,
       ];
-  for (const p of candidates) {
-    if (p && isExecutable(p)) return p;
+
+  // Deduplicate while preserving order
+  const seen = new Set<string>();
+  const allCandidates: string[] = [];
+  for (const p of [...pathCandidates, ...wellKnown]) {
+    if (p && !seen.has(p)) {
+      seen.add(p);
+      allCandidates.push(p);
+    }
   }
 
-  return undefined;
+  // 3. Pick the first compatible candidate
+  let firstUnverifiable: string | undefined;
+  for (const p of allCandidates) {
+    if (!isExecutable(p)) continue;
+
+    const compat = checkCliCompatibility(p);
+    if (compat?.compatible) {
+      if (p !== pathCandidates[0] && pathCandidates.length > 0) {
+        console.log(`[llm-provider] Skipping incompatible CLI at "${pathCandidates[0]}", using "${p}" (${compat.version})`);
+      }
+      return p;
+    }
+    if (compat) {
+      // Version detected but too old — skip it entirely, do NOT fall back
+      console.warn(`[llm-provider] CLI at "${p}" is version ${compat.version} (need >= ${MIN_CLI_MAJOR}.x), skipping`);
+    } else if (!firstUnverifiable) {
+      // Executable exists but --version failed (timeout, crash, etc.)
+      // Keep as last-resort fallback only if NO candidate had a parseable version
+      firstUnverifiable = p;
+    }
+  }
+
+  // Only fall back to an unverifiable executable — never to a known-old one.
+  // This avoids silently using a 1.x CLI that will crash on first message.
+  return firstUnverifiable;
 }
 
 // ── Multi-modal prompt builder ──
@@ -223,6 +391,34 @@ function buildPrompt(
   return (async function* () { yield msg; })();
 }
 
+/**
+ * Mutable state shared between the streaming loop and catch block.
+ *
+ * Key distinction:
+ *   hasReceivedResult — set when the SDK delivers a `result` message
+ *     (success OR structured error). This means the CLI completed its
+ *     business logic; any subsequent "process exited with code 1" is
+ *     just the transport tearing down and should be suppressed.
+ *
+ *   hasStreamedText — set when at least one text_delta was emitted.
+ *     Used to distinguish "partial output + crash" (real failure, must
+ *     emit error) from "business error only in assistant block" (use
+ *     lastAssistantText instead of generic error).
+ */
+export interface StreamState {
+  /** True once a `result` message (success or error subtype) has been processed. */
+  hasReceivedResult: boolean;
+  /** True once any text_delta has been emitted via stream_event. */
+  hasStreamedText: boolean;
+  /**
+   * Full text captured from the final `assistant` message.
+   * NOT emitted during normal flow (stream_event deltas handle that).
+   * Used by the catch block to surface business errors that arrived
+   * as assistant text but were followed by a CLI crash.
+   */
+  lastAssistantText: string;
+}
+
 export class SDKLLMProvider implements LLMProvider {
   private cliPath: string | undefined;
   private autoApprove: boolean;
@@ -243,10 +439,10 @@ export class SDKLLMProvider implements LLMProvider {
           // Ring-buffer for recent stderr output (max 4 KB)
           const MAX_STDERR = 4096;
           let stderrBuf = '';
+          const state: StreamState = { hasReceivedResult: false, hasStreamedText: false, lastAssistantText: '' };
 
           try {
             const cleanEnv = buildSubprocessEnv();
-            console.log(`[llm-provider] query params: cwd=${params.workingDirectory} model=${params.model || '(default)'} resume=${params.sdkSessionId || '(none)'} envMode=${process.env.CTI_ENV_ISOLATION || 'inherit'} envKeys=${Object.keys(cleanEnv).length}`);
 
             // Cross-runtime migration safety: drop non-Claude model names
             // that may linger in session data from a previous Codex runtime.
@@ -272,7 +468,6 @@ export class SDKLLMProvider implements LLMProvider {
               abortController: params.abortController,
               permissionMode: (params.permissionMode as 'default' | 'acceptEdits' | 'plan') || undefined,
               includePartialMessages: true,
-              debug: true,
               env: cleanEnv,
               stderr: (data: string) => {
                 stderrBuf += data;
@@ -324,35 +519,72 @@ export class SDKLLMProvider implements LLMProvider {
             });
 
             for await (const msg of q) {
-              handleMessage(msg, controller);
+              handleMessage(msg, controller, state);
             }
 
             controller.close();
           } catch (err) {
             const message = err instanceof Error ? err.message : String(err);
-            // Log full error (including stack) to bridge log for debugging
             console.error('[llm-provider] SDK query error:', err instanceof Error ? err.stack || err.message : err);
-            console.error(`[llm-provider] stderr buffer: ${stderrBuf.length} bytes`);
             if (stderrBuf) {
               console.error('[llm-provider] stderr from CLI:', stderrBuf.trim());
             }
 
-            // Detect auth errors from error message or captured stderr
-            let userMessage = message;
-            if (isAuthError(message) || isAuthError(stderrBuf)) {
-              userMessage = AUTH_ERROR_USER_MESSAGE;
-            } else if (message.includes('process exited with code')) {
-              const lines = [
-                message,
+            const isTransportExit = message.includes('process exited with code');
+
+            // ── Case 1: Result already received ──
+            // The SDK delivered a proper result (success or structured error).
+            // A trailing "process exited with code 1" is transport teardown noise.
+            if (state.hasReceivedResult && isTransportExit) {
+              console.log('[llm-provider] Suppressing transport error — result already received');
+              controller.close();
+              return;
+            }
+
+            // ── Case 2: Recognised business error in assistant text ──
+            // The CLI returned an assistant message with text that matches
+            // a known auth/access error pattern (e.g. "Your organization
+            // does not have access to Claude"). Forward it as-is — it's
+            // more informative than the generic transport error.
+            // Only activate when the text is a recognised error; otherwise
+            // a normal response that crashed before result would be silently
+            // presented as if it succeeded.
+            if (state.lastAssistantText && classifyAuthError(state.lastAssistantText)) {
+              controller.enqueue(sseEvent('text', state.lastAssistantText));
+              controller.close();
+              return;
+            }
+
+            // ── Case 3: Partial output + crash ──
+            // Text was streamed but no result arrived — the response was
+            // truncated by a real crash. Always emit an error so the user
+            // knows the output is incomplete.
+
+            // ── Build user-facing error message ──
+            const authKind = classifyAuthError(message) || classifyAuthError(stderrBuf);
+            let userMessage: string;
+            if (authKind === 'cli') {
+              userMessage = CLI_AUTH_USER_MESSAGE;
+            } else if (authKind === 'api') {
+              userMessage = API_AUTH_USER_MESSAGE;
+            } else if (isTransportExit) {
+              const stderrSummary = stderrBuf.trim();
+              const lines = [message];
+              if (stderrSummary) {
+                lines.push('', 'CLI stderr:', stderrSummary.slice(-1024));
+              }
+              lines.push(
                 '',
                 'Possible causes:',
                 '• Claude CLI not authenticated — run: claude auth login',
-                '• Claude CLI version incompatible with SDK — run: claude --version',
-                '• Missing environment variables in daemon context',
+                '• Claude CLI version too old (need >= 2.x) — run: claude --version',
+                '• Missing ANTHROPIC_* env vars in daemon — check config.env',
                 '',
-                'Diagnostics: check ~/.claude-to-im/logs/bridge.log',
-              ];
+                'Run `/claude-to-im doctor` to diagnose.',
+              );
               userMessage = lines.join('\n');
+            } else {
+              userMessage = message;
             }
 
             controller.enqueue(sseEvent('error', userMessage));
@@ -364,9 +596,11 @@ export class SDKLLMProvider implements LLMProvider {
   }
 }
 
-function handleMessage(
+/** @internal Exported for testing. */
+export function handleMessage(
   msg: SDKMessage,
   controller: ReadableStreamDefaultController<string>,
+  state: StreamState,
 ): void {
   switch (msg.type) {
     case 'stream_event': {
@@ -377,6 +611,7 @@ function handleMessage(
       ) {
         // Emit delta text — the bridge accumulates on its side
         controller.enqueue(sseEvent('text', event.delta.text));
+        state.hasStreamedText = true;
       }
       if (
         event.type === 'content_block_start' &&
@@ -394,12 +629,18 @@ function handleMessage(
     }
 
     case 'assistant': {
-      // Full assistant message — extract content blocks
-      // Text deltas are already handled by stream_event; this handles
-      // any tool_use blocks not caught by partial streaming.
+      // Full assistant message — capture text but do NOT emit it.
+      // Text deltas are already streamed via stream_event above; emitting
+      // the full text block here would duplicate the entire response.
+      //
+      // The captured text is used by the catch block to surface business
+      // errors (e.g. "Your organization does not have access") that the
+      // CLI returned as assistant text without prior streaming deltas.
       if (msg.message?.content) {
         for (const block of msg.message.content) {
-          if (block.type === 'tool_use') {
+          if (block.type === 'text' && block.text) {
+            state.lastAssistantText += (state.lastAssistantText ? '\n' : '') + block.text;
+          } else if (block.type === 'tool_use') {
             controller.enqueue(
               sseEvent('tool_use', {
                 id: block.id,
@@ -437,6 +678,7 @@ function handleMessage(
     }
 
     case 'result': {
+      state.hasReceivedResult = true;
       if (msg.subtype === 'success') {
         controller.enqueue(
           sseEvent('result', {
@@ -452,7 +694,7 @@ function handleMessage(
           }),
         );
       } else {
-        // Error result
+        // Error result from SDK (distinct from transport errors in catch)
         const errors =
           'errors' in msg && Array.isArray(msg.errors)
             ? msg.errors.join('; ')
